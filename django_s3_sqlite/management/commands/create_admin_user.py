@@ -1,8 +1,7 @@
-from django.core.management.base import BaseCommand
-from django.contrib.auth import get_user_model
+import secrets
 
-import random
-import string
+from django.contrib.auth import get_user_model
+from django.core.management.base import BaseCommand
 
 
 class Command(BaseCommand):
@@ -28,9 +27,7 @@ class Command(BaseCommand):
                 user = User.objects.create_superuser(*options["arguments"])
                 self.stdout.write(
                     self.style.SUCCESS(
-                        'Created the admin superuser "{user}" with the given parameters.'.format(
-                            user=user
-                        )
+                        f'Created admin superuser "{user}" with the given arguments.'
                     )
                 )
             except Exception as e:
@@ -48,9 +45,7 @@ class Command(BaseCommand):
 
         # or create default admin user
         else:
-            pw = "".join(
-                random.choice(string.ascii_uppercase + string.digits) for _ in range(10)
-            )
+            pw = secrets.token_urlsafe(16)
             User.objects.create_superuser("admin", "admin@admin.com", pw)
             self.stdout.write(
                 self.style.SUCCESS(

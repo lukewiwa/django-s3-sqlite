@@ -1,26 +1,27 @@
-from django.core.management.base import BaseCommand
-from django.db import connection, DatabaseError
-from django.conf import settings
+from django.core.management.base import BaseCommand, CommandError
+from django.db import DEFAULT_DB_ALIAS, connections
 
 
 class Command(BaseCommand):
     """
-    This command performs a vacuum on the S3_Sqlite database.
-    It is good to do this occasionally to keep the SQLite database stored
-    on S3 as small and unfragmented as possible. It is recommended to be
-    run after deleting data.
+    VACUUM the S3-stored SQLite database to keep it small and unfragmented.
+    Worth running after deleting a lot of data.
     """
 
-    help = "Performs a vacuum command on a S3 stored SQLite database to minimize size and fragmentation."
+    help = "VACUUMs an S3-stored SQLite database to minimise size and fragmentation."
+
+    def add_arguments(self, parser):
+        parser.add_argument("--database", default=DEFAULT_DB_ALIAS)
 
     def handle(self, *args, **options):
-        if settings.DATABASES["default"]["ENGINE"] != "django_s3_sqlite":
-            raise DatabaseError(
-                "This command is only for the 'django_s3_sqlite' Django DB engine."
+        connection = connections[options["database"]]
+        if connection.settings_dict["ENGINE"] != "django_s3_sqlite":
+            raise CommandError(
+                "This command is only for the 'django_s3_sqlite' database engine."
             )
-        else:
-            self.stdout.write(self.style.SUCCESS("Starting database VACUUM..."))
-            cursor = connection.cursor()
-            cursor.execute("VACUUM;")
-            cursor.close()
-            self.stdout.write(self.style.SUCCESS("VACUUM complete."))
+        self.stdout.write("Starting database VACUUM...")
+        with connection.cursor() as cursor:
+            cursor.execute("VACUUM")
+        # Closing pushes the result to S3, including under call_command().
+        connection.close()
+        self.stdout.write(self.style.SUCCESS("VACUUM complete."))
