@@ -9,6 +9,7 @@ uploaded with a conditional PUT, so a stale copy can't silently overwrite
 someone else's write.
 """
 
+import contextlib
 import logging
 import os
 import shutil
@@ -23,12 +24,18 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from django.core.exceptions import ImproperlyConfigured
+from django.db import DatabaseError
 from django.db.backends.sqlite3.base import DatabaseWrapper as SQLiteDatabaseWrapper
 
 log = logging.getLogger(__name__)
 
 _NOT_FOUND = {"NoSuchKey", "404", "NotFound"}
 _CONFLICT = {"PreconditionFailed", "ConditionalRequestConflict"}
+_SQLITE_HEADER = b"SQLite format 3\x00"
+
+
+class InvalidDatabaseError(DatabaseError):
+    """A database file, remote or local, isn't a usable SQLite database."""
 
 
 @dataclass
@@ -71,7 +78,16 @@ def _fingerprint(path: str) -> tuple:
 
 
 @cache
-def _s3_client(access_key, secret_key, signature_version, endpoint_url, region_name):
+def _s3_client(
+    access_key,
+    secret_key,
+    signature_version,
+    endpoint_url,
+    region_name,
+    connect_timeout,
+    read_timeout,
+    max_attempts,
+):
     # Client creation is slow and clients are thread-safe, so share them.
     session = boto3.session.Session(
         aws_access_key_id=access_key,
@@ -81,8 +97,21 @@ def _s3_client(access_key, secret_key, signature_version, endpoint_url, region_n
         "s3",
         endpoint_url=endpoint_url,
         region_name=region_name,
-        config=Config(signature_version=signature_version),
+        config=Config(
+            signature_version=signature_version,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            retries={"mode": "standard", "max_attempts": max_attempts},
+        ),
     )
+
+
+def _local_path(local_dir: str, key: str) -> str:
+    local_dir = os.path.abspath(local_dir)
+    path = os.path.abspath(os.path.join(local_dir, key.lstrip("/")))
+    if os.path.commonpath([local_dir, path]) != local_dir:
+        raise ImproperlyConfigured(f"NAME {key!r} escapes LOCAL_DIR {local_dir!r}.")
+    return path
 
 
 def _error_code(e: ClientError) -> tuple[str, int]:
@@ -108,8 +137,11 @@ class DatabaseWrapper(SQLiteDatabaseWrapper):
         except KeyError as e:
             raise ImproperlyConfigured(f"django_s3_sqlite requires {e.args[0]}.") from e
 
+        if not self.s3_bucket or not self.s3_key:
+            raise ImproperlyConfigured("django_s3_sqlite requires BUCKET and NAME.")
+
         local_dir = settings_dict.get("LOCAL_DIR") or tempfile.gettempdir()
-        self.local_path = os.path.join(local_dir, self.s3_key)
+        self.local_path = _local_path(local_dir, self.s3_key)
         settings_dict["NAME"] = self.local_path
 
         self.cache_ttl = float(settings_dict.get("CACHE_TTL", 0))
@@ -120,6 +152,9 @@ class DatabaseWrapper(SQLiteDatabaseWrapper):
             settings_dict.get("SIGNATURE_VERSION", "s3v4"),
             settings_dict.get("ENDPOINT_URL"),
             settings_dict.get("REGION_NAME"),
+            settings_dict.get("CONNECT_TIMEOUT", 5),
+            settings_dict.get("READ_TIMEOUT", 60),
+            settings_dict.get("MAX_ATTEMPTS", 5),
         )
         self._local = _local_copy(self.local_path)
         self._holding_local = False
@@ -146,12 +181,14 @@ class DatabaseWrapper(SQLiteDatabaseWrapper):
             raise
 
     def close(self):
-        super().close()
-        # Inside an atomic block Django closes the underlying connection but
-        # keeps self.connection around, flagged closed_in_transaction.
-        closed = self.connection is None or self.closed_in_transaction
-        if closed and self._holding_local:
-            self._release_local(push=True)
+        try:
+            super().close()
+        finally:
+            # Inside an atomic block Django closes the underlying connection
+            # but keeps self.connection around, flagged closed_in_transaction.
+            closed = self.connection is None or self.closed_in_transaction
+            if closed and self._holding_local:
+                self._release_local(push=True)
 
     def _release_local(self, push):
         state = self._local
@@ -168,6 +205,12 @@ class DatabaseWrapper(SQLiteDatabaseWrapper):
     def _refresh(self, state: _LocalCopy):
         """Make sure the local file is the current remote version."""
         have_local = os.path.exists(self.local_path)
+        # A previous push failed and the local copy holds changes S3 hasn't got.
+        unpushed = (
+            state.synced
+            and have_local
+            and state.fingerprint != _fingerprint(self.local_path)
+        )
         if (
             state.synced
             and have_local
@@ -176,7 +219,13 @@ class DatabaseWrapper(SQLiteDatabaseWrapper):
         ):
             return
 
-        kwargs = {"Bucket": self.s3_bucket, "Key": self.s3_key}
+        # ChecksumMode makes botocore verify the body against the object's
+        # stored checksum, where S3 has one.
+        kwargs = {
+            "Bucket": self.s3_bucket,
+            "Key": self.s3_key,
+            "ChecksumMode": "ENABLED",
+        }
         if state.synced and state.etag and have_local:
             kwargs["IfNoneMatch"] = state.etag
         try:
@@ -187,7 +236,13 @@ class DatabaseWrapper(SQLiteDatabaseWrapper):
                 log.debug("Local database matches S3 (%s).", state.etag)
                 state.checked_at = time.monotonic()
                 return
+            if code in _NOT_FOUND and unpushed and not state.exists_remotely:
+                # A new database whose first push failed. Keep it and retry.
+                state.checked_at = time.monotonic()
+                return
             if code in _NOT_FOUND:
+                if unpushed:
+                    log.error("Remote database was deleted; discarding local changes.")
                 log.info(
                     "s3://%s/%s doesn't exist, starting with an empty database.",
                     self.s3_bucket,
@@ -212,6 +267,13 @@ class DatabaseWrapper(SQLiteDatabaseWrapper):
                 return
             raise
 
+        if unpushed:
+            log.error(
+                "s3://%s/%s changed before local changes could be pushed; "
+                "discarding them.",
+                self.s3_bucket,
+                self.s3_key,
+            )
         self._write_local(response["Body"])
         state.etag = response["ETag"]
         state.exists_remotely = True
@@ -254,6 +316,9 @@ class DatabaseWrapper(SQLiteDatabaseWrapper):
             else:
                 log.exception("Couldn't push database to S3, will retry on next close.")
             return
+        except InvalidDatabaseError:
+            log.exception("Local database failed its integrity check, not pushing.")
+            return
         except Exception:
             log.exception("Couldn't push database to S3, will retry on next close.")
             return
@@ -282,6 +347,12 @@ class DatabaseWrapper(SQLiteDatabaseWrapper):
         try:
             with open(tmp, "wb") as f:
                 shutil.copyfileobj(body, f, length=1024 * 1024)
+            with open(tmp, "rb") as f:
+                header = f.read(len(_SQLITE_HEADER))
+            if header and header != _SQLITE_HEADER:
+                raise InvalidDatabaseError(
+                    f"s3://{self.s3_bucket}/{self.s3_key} isn't a SQLite database."
+                )
             self._discard_local(keep_main=True)
             os.replace(tmp, self.local_path)
         except BaseException:
@@ -291,10 +362,8 @@ class DatabaseWrapper(SQLiteDatabaseWrapper):
     def _discard_local(self, keep_main=False):
         suffixes = ("-journal", "-wal", "-shm") + (() if keep_main else ("",))
         for suffix in suffixes:
-            try:
+            with contextlib.suppress(FileNotFoundError):
                 os.remove(self.local_path + suffix)
-            except FileNotFoundError:
-                pass
 
     def _snapshot(self) -> str:
         """Copy the database with SQLite's backup API so we never upload a
@@ -305,6 +374,14 @@ class DatabaseWrapper(SQLiteDatabaseWrapper):
             dst = sqlite3.connect(tmp)
             try:
                 src.backup(dst)
+                # Never upload a corrupt database over a good one.
+                result = dst.execute("PRAGMA quick_check").fetchone()[0]
+                if result != "ok":
+                    raise InvalidDatabaseError(f"Integrity check failed: {result}")
+            except sqlite3.OperationalError:
+                raise  # locked, out of disk etc: worth retrying
+            except sqlite3.DatabaseError as e:
+                raise InvalidDatabaseError(str(e)) from e
             finally:
                 dst.close()
                 src.close()

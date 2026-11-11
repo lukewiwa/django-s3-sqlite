@@ -1,12 +1,19 @@
 import os
 import sqlite3
+import threading
 
 import pytest
 from botocore.exceptions import ClientError
+from django.core.exceptions import ImproperlyConfigured
 
 from django_s3_sqlite import base
 
 from .conftest import BUCKET, KEY
+
+FILL = (
+    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {n}) "
+    "INSERT INTO t SELECT randomblob(1000) FROM n"
+)
 
 
 def execute(db, sql, *params):
@@ -181,3 +188,190 @@ def test_wal_mode_settles_after_a_write(make_db, s3):
         assert count(db) == 1
     assert remote_etag(s3) == etag
     assert count(make_db("b")) == 1
+
+
+def test_non_sqlite_object_is_refused(make_db, s3):
+    s3.put_object(Bucket=BUCKET, Key=KEY, Body=b"<html>definitely not a database")
+    with pytest.raises(base.InvalidDatabaseError):
+        execute(make_db(), "SELECT 1")
+
+
+@pytest.mark.parametrize("name", ["../escape.db", "a/../../escape.db"])
+def test_name_cannot_escape_local_dir(make_db, name):
+    with pytest.raises(ImproperlyConfigured):
+        make_db(NAME=name)
+
+
+def test_absolute_name_stays_inside_local_dir(make_db, tmp_path):
+    db = make_db(NAME="/nested/db.sqlite3")
+    assert db.local_path == str(tmp_path / "a" / "nested" / "db.sqlite3")
+    execute(db, "CREATE TABLE t (x)")
+    assert count(make_db("b", NAME="/nested/db.sqlite3")) == 0
+
+
+def test_corrupt_local_database_is_not_pushed(make_db, s3, caplog):
+    db = make_db()
+    execute(db, "CREATE TABLE t (x)")
+    execute(db, FILL.format(n=50))
+    etag = remote_etag(s3)
+
+    # Scribble over the table's pages behind SQLite's back.
+    with open(db.local_path, "r+b") as f:
+        f.seek(4096)
+        f.write(os.urandom(4096 * 4))
+    with db._local.lock:
+        db._push(db._local)
+
+    assert remote_etag(s3) == etag
+    assert "not pushing" in caplog.text
+
+
+def test_threads_in_one_process_never_lose_writes(make_db, s3):
+    execute(make_db(), "CREATE TABLE t (x)")
+    execute(make_db(), "INSERT INTO t VALUES (0)")
+
+    def work():
+        db = make_db()
+        for _ in range(10):
+            execute(db, "UPDATE t SET x = x + 1")
+
+    threads = [threading.Thread(target=work) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert execute(make_db("fresh"), "SELECT x FROM t") == [(80,)]
+
+
+def test_racing_containers_lose_writes_loudly_not_silently(make_db, s3, caplog):
+    execute(make_db("seed"), "CREATE TABLE t (x)")
+    execute(make_db("seed"), "INSERT INTO t VALUES (0)")
+    attempts = 0
+    lock = threading.Lock()
+    barrier = threading.Barrier(6)
+
+    def work(name):
+        nonlocal attempts
+        db = make_db(name)
+        barrier.wait()
+        for _ in range(5):
+            execute(db, "UPDATE t SET x = x + 1")
+            with lock:
+                attempts += 1
+
+    threads = [threading.Thread(target=work, args=(f"c{i}",)) for i in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    conflicts = caplog.text.count("changed since it was downloaded")
+    final = execute(make_db("fresh"), "SELECT x FROM t")[0][0]
+    # Every increment either landed or was reported. None vanished quietly.
+    assert conflicts > 0, "no contention, test proves nothing"
+    assert final == attempts - conflicts
+
+
+def test_vacuum_command_pushes(make_db, s3, monkeypatch):
+    from django.core.management import call_command
+
+    from django_s3_sqlite.management.commands import s3_sqlite_vacuum
+
+    db = make_db()
+    execute(db, "CREATE TABLE t (x)")
+    execute(db, FILL.format(n=200))
+    execute(db, "DELETE FROM t")
+    before = s3.head_object(Bucket=BUCKET, Key=KEY)["ContentLength"]
+
+    monkeypatch.setattr(s3_sqlite_vacuum, "connections", {"default": db})
+    call_command("s3_sqlite_vacuum")
+
+    assert s3.head_object(Bucket=BUCKET, Key=KEY)["ContentLength"] < before
+
+
+def fail_once(monkeypatch, client, method, exc):
+    real = getattr(client, method)
+    calls = []
+
+    def flaky(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise exc
+        return real(**kwargs)
+
+    monkeypatch.setattr(client, method, flaky)
+    return calls
+
+
+S3_DOWN = ClientError({"Error": {"Code": "InternalError"}}, "PutObject")
+
+
+@pytest.mark.parametrize("missing", ["BUCKET", "NAME"])
+def test_missing_settings_are_reported(make_db, missing):
+    with pytest.raises(ImproperlyConfigured, match=missing):
+        make_db(**{missing: ""})
+
+
+def test_failed_first_push_of_new_database_is_retried(make_db, monkeypatch, caplog):
+    # Regression: the retry used to hit a 404 and wipe the unpushed file.
+    db = make_db()
+    fail_once(monkeypatch, db.s3, "put_object", S3_DOWN)
+    execute(db, "CREATE TABLE t (x)")
+    assert "will retry" in caplog.text
+
+    assert execute(db, "SELECT 1") == [(1,)]  # read-only request retries the push
+    assert count(make_db("b")) == 0
+
+
+@pytest.mark.parametrize("exc", [S3_DOWN, OSError("disk on fire")])
+def test_failed_push_is_retried_on_next_close(make_db, s3, monkeypatch, caplog, exc):
+    db = make_db()
+    execute(db, "CREATE TABLE t (x)")
+    fail_once(monkeypatch, db.s3, "put_object", exc)
+    execute(db, "INSERT INTO t VALUES (1)")
+    assert count(make_db("b")) == 0
+
+    count(db)
+    assert count(make_db("c")) == 1
+
+
+def test_unpushed_changes_overtaken_by_remote_are_reported(
+    make_db, monkeypatch, caplog
+):
+    execute(make_db("b"), "CREATE TABLE t (x)")
+    a = make_db("a")
+    count(a)
+    fail_once(monkeypatch, a.s3, "put_object", S3_DOWN)
+    execute(a, "INSERT INTO t VALUES ('a')")
+    execute(make_db("b"), "INSERT INTO t VALUES ('b')")
+
+    assert execute(a, "SELECT x FROM t") == [("b",)]
+    assert "changed before local changes could be pushed" in caplog.text
+
+
+def test_out_of_sync_copy_is_never_pushed(make_db, s3, caplog):
+    execute(make_db("b"), "CREATE TABLE t (x)")
+    a1, a2 = make_db("a"), make_db("a")  # two threads in one container
+
+    with a1.cursor() as c1:
+        c1.execute("SELECT 1")
+        execute(make_db("b"), "INSERT INTO t VALUES ('b')")
+        execute(a2, "INSERT INTO t VALUES ('a2')")  # conflicts
+        c1.execute("INSERT INTO t VALUES ('a1')")
+    a1.close()
+
+    assert "refusing to push" in caplog.text
+    assert execute(make_db("c"), "SELECT x FROM t") == [("b",)]
+    assert execute(a1, "SELECT x FROM t") == [("b",)]
+
+
+def test_vacuum_refuses_other_engines(monkeypatch):
+    from django.core.management import CommandError, call_command
+    from django.db import connections
+
+    from django_s3_sqlite.management.commands import s3_sqlite_vacuum
+
+    monkeypatch.setattr(s3_sqlite_vacuum, "connections", connections)
+    with pytest.raises(CommandError):
+        call_command("s3_sqlite_vacuum")

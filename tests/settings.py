@@ -1,4 +1,8 @@
 SECRET_KEY = "not-secret"
-INSTALLED_APPS = ["django_s3_sqlite"]
+INSTALLED_APPS = [
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django_s3_sqlite",
+]
 DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}}
 USE_TZ = True
