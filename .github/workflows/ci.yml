@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  FORCE_COLOR: "1"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: false
+      - run: uv lock --check
+      - run: uv run --locked ruff check --output-format=github
+      - run: uv run --locked ruff format --check
+
+  test:
+    name: test (py${{ matrix.python }}, django ${{ matrix.django }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        django: ["5.2", "6.0", "6.1"]
+        exclude:
+          # Django 6.x needs Python 3.12+.
+          - { python: "3.10", django: "6.0" }
+          - { python: "3.10", django: "6.1" }
+          - { python: "3.11", django: "6.0" }
+          - { python: "3.11", django: "6.1" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: false
+      - run: uv sync --locked
+      - run: uv pip install "django~=${DJANGO}.0"
+        env:
+          DJANGO: ${{ matrix.django }}
+      - run: uv run --no-sync pytest
+
+  test-lowest:
+    # Proves the lower bounds in pyproject.toml are real.
+    name: test (lowest direct dependencies)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.10"
+          enable-cache: false
+      - run: uv run --resolution lowest-direct pytest
+
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # hatch-vcs needs tags to work out the version
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: false # never build release artifacts from a cache
+      - run: uv build
+      - run: uvx twine check --strict dist/*
+      - name: Smoke test the wheel
+        run: uv run --isolated --no-project --with dist/*.whl python -c "import django_s3_sqlite.base"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  # Single required check for branch protection.
+  ci:
+    if: always()
+    needs: [lint, test, test-lowest, build]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: All jobs passed
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          echo "$RESULTS"
+          [ "$(echo "$RESULTS" | jq -r 'map(select(. != "success")) | length')" = 0 ]

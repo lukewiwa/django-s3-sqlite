@@ -1,15 +1,18 @@
 [build-system]
-requires = ["setuptools>=77", "setuptools-scm>=8"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling>=1.27", "hatch-vcs>=0.5"]
+build-backend = "hatchling.build"
 
 [project]
 name = "django-s3-sqlite"
 dynamic = ["version"]
-description = "An AWS S3-hosted SQLite database backend for Django."
+description = "A Django database backend that keeps its SQLite file in S3."
 readme = "README.md"
-license = "BSD-3-Clause"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
-authors = [{ name = "Timothy Allen", email = "flipper@peregrinesalon.com" }]
+authors = [{ name = "Timothy Allen" }, { name = "Rich Jones" }]
+maintainers = [{ name = "Luke Wiwatowski" }]
+keywords = ["django", "sqlite", "s3", "aws", "lambda", "serverless", "zappa"]
 dependencies = ["Django>=5.2", "boto3>=1.36"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -25,28 +28,62 @@ classifiers = [
     "Framework :: Django",
     "Framework :: Django :: 5.2",
     "Framework :: Django :: 6.0",
-    "Topic :: Internet :: WWW/HTTP",
+    "Framework :: Django :: 6.1",
+    "Topic :: Database",
     "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
+    "Typing :: Typed",
 ]
 
-[project.optional-dependencies]
-test = ["pytest>=8", "pytest-django>=4.9", "moto[s3]>=5.1"]
-
 [project.urls]
-Homepage = "https://github.com/FlipperPA/django-s3-sqlite/"
+Homepage = "https://github.com/lukewiwa/django-s3-sqlite"
+Source = "https://github.com/lukewiwa/django-s3-sqlite"
+Issues = "https://github.com/lukewiwa/django-s3-sqlite/issues"
+Changelog = "https://github.com/lukewiwa/django-s3-sqlite/releases"
 
-[tool.setuptools.packages.find]
-include = ["django_s3_sqlite*"]
+[dependency-groups]
+dev = [
+    "moto[s3]>=5.1.5",  # first release honouring If-Match on PutObject
+    "pytest>=8",
+    "pytest-cov>=6",
+    "pytest-django>=4.9",
+    "pytest-timeout>=2.3",
+    "ruff>=0.14",
+]
 
-[tool.setuptools_scm]
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+# Untagged history builds as 0.1.0.devN rather than 0.1.devN.
+fallback_version = "0.1.0.dev0"
+
+[tool.hatch.build.targets.sdist]
+include = ["django_s3_sqlite", "tests", "README.md", "LICENSE"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["django_s3_sqlite"]
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "tests.settings"
 testpaths = ["tests"]
 pythonpath = ["."]
+addopts = ["--strict-markers", "--cov=django_s3_sqlite", "--cov-report=term-missing"]
+timeout = 60
+filterwarnings = [
+    "error",
+    # Older botocore/moto releases, exercised by the lowest-direct CI job.
+    "ignore:datetime.datetime.utcnow:DeprecationWarning:botocore",
+    "ignore:datetime.datetime.utcnow:DeprecationWarning:moto",
+]
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+fail_under = 90
 
 [tool.ruff]
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+select = ["E", "F", "I", "UP", "B", "SIM", "PT", "RUF"]

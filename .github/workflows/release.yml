@@ -1,0 +1,39 @@
+name: Release
+
+# Publishing a GitHub release runs the full CI and, if it passes, uploads that
+# exact build to PyPI with trusted publishing (OIDC). No API tokens anywhere.
+
+on:
+  release:
+    types: [published]
+
+permissions: {}
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  publish:
+    needs: ci
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/django-s3-sqlite/
+    permissions:
+      id-token: write # trusted publishing and attestations
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - name: Check the build matches the release tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="${TAG#v}"
+          ls dist
+          test -f "dist/django_s3_sqlite-${version}.tar.gz"
+          test -f "dist/django_s3_sqlite-${version}-py3-none-any.whl"
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3

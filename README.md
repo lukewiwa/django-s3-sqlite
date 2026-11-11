@@ -1,112 +1,166 @@
 # django-s3-sqlite
 
-[![PyPI](https://img.shields.io/pypi/v/django-s3-sqlite.svg)](https://pypi.python.org/pypi/django-s3-sqlite)
+[![PyPI](https://img.shields.io/pypi/v/django-s3-sqlite.svg)](https://pypi.org/project/django-s3-sqlite/)
+[![CI](https://github.com/lukewiwa/django-s3-sqlite/actions/workflows/ci.yml/badge.svg)](https://github.com/lukewiwa/django-s3-sqlite/actions/workflows/ci.yml)
 
-This project was inspired and started with [Zappa](https://github.com/Miserlou/Zappa). Thanks to [Rich Jones](https://github.com/Miserlou) for all of his amazing work.
+A Django database backend that keeps its SQLite file in S3.
+
+It's a good fit for read-heavy sites with the occasional writer (a blog, a CMS, an internal tool) running on AWS Lambda or similar, where it costs pennies a month instead of an RDS instance. It's a bad fit for anything with concurrent writers. See [Writes](#writes) for exactly what happens there.
+
+Requires Python 3.10+, Django 5.2+ and boto3 1.36+.
 
 ## Installation
 
-Install via `pip`:
+```bash
+uv add django-s3-sqlite
+```
 
-    $ pip install django-s3-sqlite
-
-Add to your installed apps:
-
-    INSTALLED_APPS += ["django_s3_sqlite"]
-
-## Using an S3-Backed Database Engine
-
-`django-s3-sqlite` allows use of an [S3-synced SQLite database](https://blog.zappa.io/posts/s3sqlite-a-serverless-relational-database) as a Django database engine.
-
-It scales very well for high-read applications that don't have concurrent writes (like a CMS for your blog), and it's orders of magnitude cheaper than AWS RDS or Aurora (pennies per month instead of many dollars per month). It is not a good fit for applications with concurrent writers; see [Writes](#writes).
-
-#### Django Settings
+or `pip install django-s3-sqlite`. Then:
 
 ```python
+INSTALLED_APPS += ["django_s3_sqlite"]
+
 DATABASES = {
     "default": {
         "ENGINE": "django_s3_sqlite",
         "NAME": "sqlite.db",  # the object key in the bucket
         "BUCKET": "your-db-bucket",
-        # Everything below is optional.
-        "CACHE_TTL": 0,  # seconds to trust the local copy without asking S3
-        "CONDITIONAL_WRITES": True,  # reject writes based on a stale copy
-        "LOCAL_DIR": "/tmp",  # where the local copy lives
-        "AWS_S3_ACCESS_KEY": "AKIA0000000000000000",  # to lock the bucket to an IAM user
-        "AWS_S3_ACCESS_SECRET": "9tIZfakefakefakefakeT9Q6LD6jB5UyofakeISN",
-        "REGION_NAME": "us-east-1",
-        "ENDPOINT_URL": None,  # for S3-compatible stores, MinIO, LocalStack etc.
-        "SIGNATURE_VERSION": "s3v4",
     }
 }
 ```
 
-Without explicit keys, boto3's normal credential chain is used (on Lambda, the function's role). The role needs `s3:GetObject` and `s3:PutObject` on the key.
+The app only needs to be in `INSTALLED_APPS` for its management commands; the backend works without it.
 
-#### How it works
+### Options
 
-Each process keeps a local copy of the database in `LOCAL_DIR`.
-
-**Reads.** When Django opens a connection, the local copy is revalidated with a conditional `GET` using the ETag of the version we last saw. If nothing changed, S3 answers `304 Not Modified` and no data moves. If it did change, the new version is streamed to a temp file and swapped in atomically. Read-only requests never upload anything, and change detection is a `stat()` rather than hashing the file.
-
-If even the revalidation round trip is too much, set `CACHE_TTL` to a number of seconds. Within that window the local copy is used without asking S3 at all, so a container may serve data up to that many seconds stale. With conditional writes on, that staleness can't turn into lost data: a write based on a stale copy is rejected (see below).
-
-If S3 can't be reached but we already have a synced local copy, we log a warning and serve the local copy. If there's no local copy we raise, rather than starting from an empty database and later overwriting the real one.
-
-#### Writes
-
-When the last connection closes and the local file has changed, a consistent snapshot is taken with SQLite's backup API and uploaded with a conditional `PUT` (`If-Match` the ETag we downloaded, or `If-None-Match: *` for a brand new database).
-
-If someone else wrote in the meantime, S3 rejects the upload: the write is discarded, an error is logged, and the next connection downloads the current version. This is still last-writer-loses, but it's loud and it never clobbers someone else's data. Set `CONDITIONAL_WRITES` to `False` for the old last-writer-wins behaviour, e.g. on an S3-compatible store that doesn't support conditional writes.
-
-Don't bother with WAL mode; the whole file is shipped around anyway.
-
-#### Runtime
-
-Django 5.2+ needs SQLite 3.31+. The AWS Lambda Python 3.12+ runtimes (Amazon Linux 2023) ship a new enough SQLite, so no custom `_sqlite3.so` is needed any more. Use one of those.
-
-#### Vacuum
-
-Since SQLite keeps the database in a single file, you will want to keep it as small and defragmented as possible. It is good to occasionally perform a database vacuum, especially after deleting or updating data:
-
-```bash
-zappa manage [instance] s3_sqlite_vacuum
-```
-
-## Creating a Default Admin User 
-
-You'll probably need a default user to manage your application with, so you can now:
-
-    $ zappa manage <stage> create_admin_user
-
-Or you can pass some arguments:
-   
-    $ zappa manage <stage> create_admin_user one two three
-
-This will internally make this call:
+All optional, defaults shown.
 
 ```python
-User.objects.create_superuser("one", "two", "three")
+DATABASES = {
+    "default": {
+        "ENGINE": "django_s3_sqlite",
+        "NAME": "sqlite.db",
+        "BUCKET": "your-db-bucket",
+        # Seconds to trust the local copy without asking S3. See Reads.
+        "CACHE_TTL": 0,
+        # Reject writes based on a stale copy instead of clobbering. See Writes.
+        "CONDITIONAL_WRITES": True,
+        # Where the local copy lives. NAME is resolved inside it.
+        "LOCAL_DIR": tempfile.gettempdir(),
+        # S3 client.
+        "REGION_NAME": None,
+        "ENDPOINT_URL": None,  # MinIO, LocalStack, R2 etc.
+        "SIGNATURE_VERSION": "s3v4",
+        "CONNECT_TIMEOUT": 5,
+        "READ_TIMEOUT": 60,
+        "MAX_ATTEMPTS": 5,  # botocore "standard" retry mode
+        # Static credentials, if you want the bucket locked to one IAM user.
+        "AWS_S3_ACCESS_KEY": None,
+        "AWS_S3_ACCESS_SECRET": None,
+    }
+}
 ```
 
-# Release Notes & Contributors
+Without static credentials boto3's normal chain applies, which on Lambda means the function's role. It needs `s3:GetObject` and `s3:PutObject` on the key.
 
-* Thank you to our [wonderful contributors](https://github.com/FlipperPA/django-s3-sqlite/graphs/contributors)!
-* Release notes are [available on GitHub](https://github.com/FlipperPA/django-s3-sqlite/releases).
+### Runtime
 
-# Maintainers and Creator
+Django 5.2 needs SQLite 3.31+. On Lambda, use a Python 3.12+ runtime: they're Amazon Linux 2023 and ship a new enough SQLite. The old advice about dropping a custom `_sqlite3.so` into your project no longer applies.
 
-* Maintainer: Tim Allen (https://github.com/FlipperPA/)
-* Maintainer: Peter Baumgartner (https://github.com/ipmb/)
-* Original Creator: Rich Jones (https://github.com/Miserlou/)
+## How it works
 
-This package is largely maintained by the staff of [Wharton Research Data Services](https://wrds.wharton.upenn.edu/). We are thrilled that [The Wharton School](https://www.wharton.upenn.edu/) allows us a certain amount of time to contribute to open-source projects. We add features as they are necessary for our projects, and try to keep up with Issues and Pull Requests as best we can. Due to time constraints (our full time jobs!), Feature Requests without a Pull Request may not be implemented, but we are always open to new ideas and grateful for contributions and our package users.
+Each process keeps a local copy of the database in `LOCAL_DIR`, plus the ETag of the S3 object it came from.
 
-# Development
+### Reads
+
+Every time Django opens a connection (by default, once per request) the local copy is revalidated with a conditional `GET` on that ETag:
+
+- Unchanged: S3 answers `304 Not Modified`. No data moves.
+- Changed: the new version streams to a temp file, is verified against S3's stored checksum (where it has one) and checked for a SQLite header, then swapped in atomically.
+- Missing: you start with an empty database, and nothing is created in S3 until you actually write something.
+
+A read-only request costs one small S3 round trip and a `stat()`. Nothing is hashed and nothing is uploaded.
+
+If that round trip still matters, set `CACHE_TTL`. Within that many seconds of the last check, the local copy is used without asking S3 at all, so a container can serve data up to `CACHE_TTL` seconds stale. Because writes are conditional, that staleness can't turn into lost data.
+
+If S3 is unreachable and we have a synced local copy, we log a warning and serve it. If there's no local copy we raise, rather than quietly starting from an empty database and later overwriting the real one with it.
+
+The local copy is only ever replaced when no other connection in the process has it open.
+
+### Writes
+
+When a connection closes and the local file has changed, we:
+
+1. take a consistent snapshot with SQLite's backup API, so a half-written file is never uploaded;
+2. run `PRAGMA quick_check` on the snapshot, so a corrupt file is never uploaded over a good one;
+3. upload it with a conditional `PUT`: `If-Match` the ETag we downloaded, or `If-None-Match: *` for a brand-new database.
+
+If someone else wrote in the meantime, S3 rejects the upload with `412`. The write is discarded, an error is logged, and the next connection downloads the current version. So concurrent writes still lose, but they lose loudly, and they never clobber someone else's data.
+
+If the upload fails for any other reason (network, throttling), the local changes are kept and retried when the next connection closes. If S3 moves on before that retry succeeds, the local changes are discarded and an error is logged.
+
+`CONDITIONAL_WRITES = False` brings back the old last-writer-wins behaviour, for S3-compatible stores that don't support conditional writes.
+
+Don't bother with WAL mode; the whole file gets shipped around regardless.
+
+### Caveats
+
+- Changes reach S3 when a connection *closes*. Django closes connections at the end of each request, and `manage.py` closes them on exit. `call_command()` doesn't, and Zappa's `manage` uses it, so a `zappa manage <stage> migrate` reaches S3 when the next request finishes. `s3_sqlite_vacuum` closes its connection itself.
+- The database is uploaded whole on every write. Keep it small.
+- The test runner's throwaway database never touches S3.
+
+## Management commands
+
+Since SQLite keeps everything in one file, vacuum it now and then, particularly after deleting a lot of data:
 
 ```bash
-pip install -e ".[test]"
-pytest
+zappa manage <stage> s3_sqlite_vacuum
 ```
 
-The tests run against [moto](https://github.com/getmoto/moto), so no AWS account is needed.
+To create a superuser with a random password:
+
+```bash
+zappa manage <stage> create_admin_user
+```
+
+Or with explicit arguments, passed straight to `User.objects.create_superuser()`:
+
+```bash
+zappa manage <stage> create_admin_user username email password
+```
+
+## Development
+
+```bash
+uv sync
+```
+
+```bash
+uv run pytest
+```
+
+```bash
+uv run ruff check && uv run ruff format --check
+```
+
+The tests run against [moto](https://github.com/getmoto/moto), so you don't need an AWS account. They cover the conflict, retry and corruption paths, and include a race between several simulated containers to check that every lost write is reported.
+
+CI tests every supported Python and Django combination, plus the lowest versions `pyproject.toml` allows.
+
+## Releasing
+
+Versions come from git tags via `hatch-vcs`. To release:
+
+1. Create a GitHub release with a tag like `v0.1.0`.
+2. The `Release` workflow runs the full CI, checks the built version matches the tag, and publishes to PyPI with [trusted publishing](https://docs.pypi.org/trusted-publishers/). No API tokens are involved.
+
+One-off setup:
+
+- On PyPI, under the project's *Publishing* settings, add a GitHub trusted publisher: this repository, workflow `release.yml`, environment `pypi`.
+- In GitHub, create an environment called `pypi`. Adding yourself as a required reviewer makes every release wait for a click before it goes out.
+
+## Credits
+
+Originally created by [Rich Jones](https://github.com/Miserlou) as part of [Zappa](https://github.com/zappa/Zappa), then maintained by [Tim Allen](https://github.com/FlipperPA) and [Peter Baumgartner](https://github.com/ipmb) with support from [Wharton Research Data Services](https://wrds.wharton.upenn.edu/). Now maintained by [Luke Wiwatowski](https://github.com/lukewiwa).
+
+MIT licensed. See [LICENSE](LICENSE).
